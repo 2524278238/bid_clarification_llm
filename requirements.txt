@@ -1,0 +1,11 @@
+
+fastapi
+uvicorn
+python-multipart
+python-dotenv
+requests
+pypandoc
+mammoth
+openai
+# uvloop removed as it's not supported on Windows
+# httptools removed as it's optional

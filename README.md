@@ -1,0 +1,131 @@
+# 清标助手 (Bid Purification Assistant)
+
+本项目是一个基于 LLM（大语言模型）和 OCR 技术构建的智能清标工具，旨在自动化处理投标文件，从非结构化文档（PDF/Word）中精准提取商务和技术关键信息。
+
+本项目核心基于魔改版的 `langextract` 框架开发，集成了 DeepSeek-OCR 进行文档解析，并采用了“字段级溯源”与“总结级归纳”的双轨抽取策略。
+
+## 📚 关于 LangExtract 框架
+
+本项目构建在 Google 开源的 [LangExtract](https://github.com/google/langextract) 框架之上。LangExtract 是一个利用 LLM 从非结构化文本中提取结构化信息的强大工具库。
+
+**原版核心工作流 (Original Workflow)：**
+1.  **分块 (Chunking)**：将长文档切分为多个重叠的文本块，确保上下文完整性。
+2.  **抽取 (Extraction)**：并行调用 LLM 从每个文本块中提取候选实体。LLM 返回的是非结构化的文本片段。
+3.  **对齐与溯源 (Alignment & Grounding)**：这是最核心也是最耗时的步骤。系统会将 LLM 生成的文本（可能包含轻微的改写、标点变化或同义词替换）与原始文档内容进行“模糊匹配”，以确定其精确的字符级位置（Start/End Index）。
+4.  **聚合与打分 (Aggregation & Scoring)**：合并来自不同块的重复实体，并根据匹配置信度进行打分和去重。
+
+**核心特性：**
+*   **精确溯源 (Precise Source Grounding)**：能够将提取的每一个数据点精确映射回原文的具体位置（字符级偏移）。这正是清标助手实现“点击数据跳转原文”功能的基石。
+*   **长文档优化**：内置了智能文本分块 (Chunking)、并行处理 (Parallel Processing) 和多轮抽取 (Multi-pass Extraction) 机制，完美解决了投标文件篇幅长、信息分散的难题。
+*   **结构化输出**：利用 LLM 的受控生成能力，确保提取结果严格符合预定义的 Schema，无需复杂的后处理。
+
+### ⚠️ 本项目的“魔改”适配
+为了满足清标业务的特殊需求，我们对原版 LangExtract 进行了以下深度定制：
+
+1.  **强制关闭原生模糊匹配 (Disabled Native Fuzzy Alignment)**：
+    *   **修改点**：在 `annotation.py` 中显式设置 `enable_fuzzy_alignment=False`。
+    *   **原因解释**：原版 LangExtract 的模糊对齐算法在处理中文长文档时计算复杂度极高（O(N*M)），导致单次抽取耗时过长，严重影响清标服务的实时响应能力。
+    *   **替代方案**：我们在后续的业务处理层（Business Logic Layer）实现了一套更轻量级、针对性更强的模糊匹配算法（基于关键词定位和局部上下文匹配），在保证溯源精度的同时显著提升了性能。
+
+2.  **DeepSeek-OCR 集成**：扩展了数据摄入层，支持异步调用 DeepSeek-OCR 解析 PDF/图片，并保留了关键的分页符信息 (`<--- Page Split --->`)。
+
+3.  **业务逻辑封装**：在底层抽取能力之上，封装了“字段类”（强溯源）和“总结类”（弱溯源、强归纳）两种高层业务模式。
+
+4.  **Prompt 模板优化**：针对中文招投标文件的语言风格，重新设计了 Few-Shot 示例和 Prompt 模板，提高了对“报价”、“工期”、“资质”等特定实体的敏感度。
+
+## 🛠️ 部署依赖服务
+
+要运行本项目，需要部署或配置以下基础服务：
+
+1.  **大语言模型服务 (LLM Service)**
+    *   需要兼容 OpenAI API 格式的接口。
+    *   推荐使用支持长上下文（Long Context）的模型，用于处理长文档摘要和复杂逻辑判断。
+    *   配置项：`MODEL_URL` (Base URL), `MODEL_KEY` (API Key), `MODEL_ID` (Model Name).
+
+2.  **OCR 文档解析服务**
+    *   **DeepSeek-OCR Server**: 这是一个专门的异步 OCR 服务。
+    *   **功能**: 负责将 PDF 扫描件或电子件转换为带有分页符（`<--- Page Split --->`）的 Markdown 格式。
+    *   **交互方式**: 异步任务提交 -> 轮询状态 -> 获取结果。
+
+3.  **魔改版 LangExtract 框架**
+    *   本项目依赖一个定制化的 `langextract` 库（已包含在项目中或需指定 `PYTHONPATH`）。
+    *   **修改点**: 增加了对 DeepSeek-OCR 的适配、多轮抽取策略配置 (`extraction_passes`) 以及针对清标业务的 Prompt 模板优化。
+
+## 🚀 核心处理逻辑
+
+本项目的处理流程（Pipeline）如下：
+
+### 1. 清标项解析与分类 (Template Analysis)
+*   **输入**: 甲方提供的 Excel 清标模板。
+*   **过程**: 系统读取 Excel 表头，调用 LLM 自动分析每一列的语义，将其分类为以下四种类型之一：
+    *   **商务-字段类** (如：投标报价、工期)
+    *   **商务-总结类** (如：资质证明材料)
+    *   **技术-字段类** (如：设备规格型号)
+    *   **技术-总结类** (如：技术实施方案、售后服务承诺)
+
+### 2. 文档预处理 (Document Processing)
+*   **输入**: 投标文件列表（支持 PDF 和 Word 格式）。
+*   **PDF 处理**: 调用 DeepSeek-OCR 服务将 PDF 转为 Markdown。
+*   **Word 处理**: 提取文本后，每 2000 字符插入一个逻辑分页符 `<--- Page Split --->`。
+*   **缓存机制**: 生成的 Markdown 文件会被缓存（基于文件 Hash），避免重复 OCR，提高二次运行速度。
+
+### 3. 基础信息提取 (Basic Info Extraction)
+*   **过程**: 截取合并后文档的 **前 3 页** 内容。
+*   **目的**: 提取 **项目名称**、**招标方（甲方）**、**投标方（乙方）**。
+*   **作用**: 这些基础信息将作为全局上下文（Context）注入到后续的正式抽取 Prompt 中，帮助模型区分“我方”与“他方”信息，显著提高准确率。
+
+### 4. 双轨信息抽取 (Dual-Track Extraction)
+
+系统根据第一步的分类结果，采用不同的抽取策略：
+
+*   **策略 A：字段类抽取 (Field Extraction)**
+    1.  **初筛**: LLM 扫描全文，提取所有可能的候选答案。
+    2.  **溯源**: 针对每个候选答案，反向定位其在原文中的页码和段落。
+    3.  **精选 (Refine)**: 将“基础信息 + 字段名 + 候选答案 + 原文上下文”再次喂给 LLM，让其从候选中选择**最精准的一个**。
+
+*   **策略 B：总结类抽取 (Summary Extraction)**
+    1.  **检索**: LLM 检索全文中与该清标项相关的所有片段。
+    2.  **归纳**: 聚合所有相关片段，让 LLM 生成一段 100 字以内的精炼总结。
+    3.  **特性**: 总结类抽取**跳过精确页码溯源**，只返回生成的总结文本。
+
+## 📥 输入与输出
+
+### 输入 (Input)
+调用 `/purify` 接口，传入 JSON 数据：
+```json
+{
+  "template_path": "/path/to/清标模板.xlsx",
+  "model_url": "https://api.example.com/v1",
+  "model_key": "sk-xxxxxxxx",
+  "model_id": "deepseek-chat",
+  "pdf_urls": [
+    "/path/to/投标文件_商务标.pdf",
+    "/path/to/投标文件_技术标.docx"
+  ]
+}
+```
+
+### 输出 (Output)
+返回结构化的清标结果：
+```json
+{
+  "status": "success",
+  "data": [
+    {
+      "item_name": "投标报价",
+      "item_type": "商务-字段类",
+      "value": "1500000.00 元",
+      "source": {
+        "page": 5,
+        "context": "报价一览表...投标总价：1500000.00 元..."
+      }
+    },
+    {
+      "item_name": "技术方案",
+      "item_type": "技术-总结类",
+      "value": "本方案采用模块化设计，包含前端采集、数据处理及后端存储三部分...",
+      "source": null
+    }
+  ]
+}
+```
